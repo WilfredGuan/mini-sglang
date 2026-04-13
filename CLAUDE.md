@@ -65,6 +65,18 @@ python/minisgl/
 └── __main__.py       # python -m minisgl 入口
 ```
 
+> **前置知识 & 依赖**
+>
+> | 领域 | 需要了解 | 对应依赖 / 工具 |
+> |------|---------|----------------|
+> | Python 打包 | `pyproject.toml` + `setuptools`，`pip install -e .` 的含义 | `setuptools` |
+> | 异步 Web 框架 | FastAPI 的路由、中间件、SSE 流式响应 | `fastapi`, `uvicorn`, `sse-starlette` |
+> | 进程间通信 | ZeroMQ 的 PUSH/PULL、PUB/SUB 模式；`msgpack` 序列化 | `pyzmq`, `msgpack` |
+> | GPU 编程基础 | CUDA stream、kernel launch、显存分配的基本概念 | `torch.cuda`, CUDA Toolkit |
+> | Tokenizer | HuggingFace `transformers.AutoTokenizer` 的用法、chat_template | `transformers`, `tokenizers` |
+>
+> **自行扩展方向**: 如果你想给项目加 gRPC 接口或 WebSocket 推送，主要改 `server/api_server.py`；如果想换序列化协议（如 protobuf），改 `server/` 和 `scheduler/io.py` 中的 msgpack 部分。
+
 ---
 
 ## 二、一个请求的完整生命周期
@@ -102,6 +114,17 @@ python/minisgl/
 7. **异步回写**: next_token 异步 GPU→CPU 拷贝，同时写入 `token_pool`
 8. **Decode 循环**: 请求进入 `DecodeManager.running_reqs`，每轮生成一个 token，直到 EOS 或 max_tokens
 9. **完成回收**: 释放 page_table 槽位，将 KV 页插入基数树供后续请求复用
+
+> **前置知识 & 依赖**
+>
+> | 领域 | 需要了解 | 对应依赖 / 工具 |
+> |------|---------|----------------|
+> | 自回归生成 | Prefill (prompt 一次算完) vs Decode (逐 token 生成) 的两阶段本质 | — |
+> | CUDA 异步语义 | `non_blocking=True` 的 GPU↔CPU 拷贝、`torch.cuda.Event` 做同步 | `torch.cuda` |
+> | ZMQ 消息模式 | 理解 5 条 IPC socket 的拓扑 (PUSH/PULL + PUB/SUB)，见 `server/launch.py` | `pyzmq` |
+> | 多进程模型 | `multiprocessing.Process`、进程间无共享 GPU 显存 | Python `multiprocessing` |
+>
+> **自行扩展方向**: 如果你想加请求优先级队列、基于长度的调度策略、或请求超时取消机制，核心修改点在步骤 2-4，即 `scheduler/prefill.py` 的 `pending_list` 和 `PrefillAdder` 逻辑。
 
 ---
 
@@ -215,6 +238,25 @@ CPU:  ┃                  ┃ process_last(N) + schedule(N+1) ┃ process_last(
 - 线性层: `ColumnParallelLinear` (输出维度切分) / `RowParallelLinear` (输入维度切分)
 - Embedding/LMHead: vocab 按 TP 切分，前向后 all_reduce / all_gather
 
+> **前置知识 & 依赖 (覆盖 3.1 ~ 3.8)**
+>
+> | 领域 | 需要了解 | 对应依赖 / 工具 |
+> |------|---------|----------------|
+> | OS 虚拟内存 | 页表 (page table)、按需分配、碎片整理的基本概念 — PagedAttention 直接类比 | — |
+> | 数据结构 | 压缩字典树 (Radix/Patricia Trie)、LRU 驱逐、引用计数 | — |
+> | CUDA Stream & Event | 多 stream 并发、`stream.wait_stream()`、`Event.record/synchronize` | `torch.cuda` |
+> | CUDA Graph | `torch.cuda.CUDAGraph` 的 capture/replay 原理、memory pool 共享 | `torch.cuda`, CUDA 12+ |
+> | FlashAttention 原理 | tiling + online softmax 避免 O(N^2) 显存；FA2 vs FA3 (Hopper warp-specialization) | `flashinfer`, `sgl_kernel` |
+> | Kernel Fusion | 为什么 fused_add_rmsnorm、inplace RoPE 能减少 HBM 访问 | — |
+> | 并行策略 | Tensor Parallelism 中 Column/Row 切分 + all_reduce/all_gather 的通信开销分析 | `nccl`, `torch.distributed` |
+> | NCCL 通信 | NCCL allreduce/allgather 的调用方式；PyNCCL 绕过 torch.distributed 降低延迟的原因 | `pynccl.cu`, NCCL 2.x |
+>
+> **自行扩展方向**:
+> - **新的缓存驱逐策略** (如 LFU、ARC): 改 `kvcache/radix_manager.py` 的 `evict()` 方法
+> - **Speculative Decoding**: 需要在 `engine/engine.py` 的 `forward_batch` 中加 draft model 前向 + verify 逻辑，同时修改 `scheduler/decode.py` 支持一次验证多个 token
+> - **Pipeline Parallelism**: 需要拆分模型层到不同 GPU，改 `engine/engine.py` 的 forward 路径和 `distributed/impl.py` 的通信原语
+> - **自定义 Attention 变体** (如 Sliding Window、Cross Attention): 在 `attention/` 下新建后端，继承 `BaseAttnBackend`
+
 ---
 
 ## 四、MoE (Mixture of Experts) 支持
@@ -232,6 +274,21 @@ hidden → gate (路由器) → topk_softmax → fused_moe_kernel (Triton) → r
   2. `moe_align_block_size()` — 将 token 按专家分组并对齐到 block 边界
   3. 两次 `fused_moe_kernel_triton` — gate_up_proj → activation → down_proj
   4. `moe_sum_reduce_triton()` — 合并 top-k 专家的输出
+
+> **前置知识 & 依赖**
+>
+> | 领域 | 需要了解 | 对应依赖 / 工具 |
+> |------|---------|----------------|
+> | MoE 基础 | 稀疏激活原理：每个 token 只激活 top-k 个专家，而非全部 | — |
+> | 路由机制 | Softmax 路由 → top-k 选择 → load balancing loss 的基本概念 | — |
+> | Triton 编程 | `@triton.jit` 装饰器、block 级 tiling、shared memory、L2 cache 分组优化 | `triton` (OpenAI Triton) |
+> | GPU GEMM 优化 | 分块矩阵乘 (tiled GEMM)、block size 对 occupancy 和 cache 命中率的影响 | — |
+> | Activation 函数 | SiLU (Swish)、GeGLU 等 gated activation 的 fused 实现 | `sgl_kernel` |
+>
+> **自行扩展方向**:
+> - **Expert Parallelism (EP)**: 当前 MoE 权重在每张卡上完整存放，如果专家数很多可以改为跨卡切分，需改 `layers/moe.py` 的权重布局和 `distributed/impl.py` 加 all-to-all 通信
+> - **新的路由策略** (如 Expert Choice、Hash Routing): 替换 `moe/fused.py` 中 `fused_topk()` 的 topk_softmax 逻辑
+> - **Triton kernel 调优**: `kernel/triton/fused_moe.py` 中的 `BLOCK_SIZE_M/N/K` 和 `GROUP_SIZE_M` 可以通过 auto-tuning 搜索最优配置
 
 ---
 
@@ -265,6 +322,16 @@ class Context:
     moe_backend: BaseMoE
     batch: Batch            # 当前正在前向的批次 (forward_batch 上下文管理器设置)
 ```
+
+> **前置知识 & 依赖**
+>
+> | 领域 | 需要了解 | 对应依赖 / 工具 |
+> |------|---------|----------------|
+> | Python dataclass | `dataclass`、`__slots__`、property 的用法 | Python stdlib |
+> | 上下文管理器 | `contextmanager` 装饰器、`with` 语句的 enter/exit 语义 — `Context.forward_batch()` 用此模式 | Python stdlib |
+> | Tensor 索引 | PyTorch 高级索引 (fancy indexing)、scatter/gather 操作 — `page_table[req_idx, pos]` 的核心 | `torch` |
+>
+> **自行扩展方向**: 如果你要加新的请求级状态 (如 beam search 的 beam_width、repetition penalty 的历史 token)，在 `Req` 中加字段，然后在 `BatchSamplingArgs.prepare()` 中收集到 GPU tensor 即可。
 
 ---
 
@@ -308,6 +375,22 @@ class Context:
 - Triton kernel: 放在 `kernel/triton/`
 - 编译时 C++/CUDA: 放在 `kernel/csrc/src/`
 
+> **前置知识 & 依赖**
+>
+> | 领域 | 需要了解 | 对应依赖 / 工具 |
+> |------|---------|----------------|
+> | HuggingFace 模型结构 | `config.json` 中各字段含义 (num_layers, hidden_size, num_attention_heads 等) | `transformers` |
+> | 权重映射 | HF checkpoint 的 state_dict key 命名规则，以及如何映射到自定义模型 | `safetensors` |
+> | TP 切分规则 | 哪些权重按行切、哪些按列切 — 参考 Megatron-LM 的 Column/Row 并行论文 | — |
+> | CUDA C++ 编程 | 写自定义 kernel 需要：grid/block 配置、shared memory、warp 操作 | CUDA Toolkit, `nvcc` |
+> | Triton 编程 | 写 fused kernel 需要：`@triton.jit`、block-level tiling、auto-tuning | `triton` |
+> | tvm-ffi | JIT kernel 注册机制 — `kernel/csrc/jit/` 下的 .cu 文件通过 tvm-ffi 暴露给 Python | `tvm` |
+>
+> **自行扩展方向**:
+> - **添加新模型架构** (如 Mixtral、DeepSeek-V2): 参考 `models/qwen3_moe.py`，重点是 attention 变体 (GQA/MQA/MLA) 和 MLP 结构
+> - **自定义采样** (如 min_p, repetition penalty, beam search): 改 `engine/sample.py` + `core.py:SamplingParams`
+> - **新的 KV Cache 布局** (如 multi-query 共享 KV): 改 `kvcache/mha_pool.py` 的 shape 和 `layers/attention.py` 的 head 切分
+
 ---
 
 ## 七、快速启动
@@ -336,6 +419,17 @@ python benchmark/offline/bench.py --model-path Qwen/Qwen2.5-7B-Instruct
 --memory-ratio 0.9         # KV cache 占 GPU 显存比例
 ```
 
+> **前置知识 & 依赖**
+>
+> | 领域 | 需要了解 | 对应依赖 / 工具 |
+> |------|---------|----------------|
+> | Python 可编辑安装 | `pip install -e .` 的工作原理、`pyproject.toml` 中 `[project.scripts]` 定义 CLI 入口 | `pip`, `setuptools` |
+> | GPU 环境 | `nvidia-smi` 查看 GPU 型号/显存、`CUDA_VISIBLE_DEVICES` 控制可见卡号 | CUDA Toolkit |
+> | HTTP 调试 | `curl` 发送 POST 请求、`jq` 解析 JSON 响应、SSE 流式输出的观察 | `curl`, `jq` |
+> | 性能分析 | `torch.profiler` 或 `nsys profile` 分析 kernel 耗时和 GPU 利用率 | `nsight-systems`, `torch.profiler` |
+>
+> **自行扩展方向**: 如果你想做 A/B 性能对比 (如 radix vs naive、overlap vs normal)，可以用 `benchmark/offline/bench.py` 配合不同 `--cache` / 环境变量跑离线 benchmark，对比 throughput 和 latency。
+
 ---
 
 ## 八、环境变量
@@ -346,6 +440,15 @@ python benchmark/offline/bench.py --model-path Qwen/Qwen2.5-7B-Instruct
 | `MINISGL_OVERLAP_EXTRA_SYNC` | `false` | 额外 stream 同步 (调试用) |
 | `MINISGL_FLASHINFER_USE_TENSOR_CORES` | auto | 强制 FlashInfer decode 使用 tensor core |
 | `MINISGL_PYNCCL_MAX_BUFFER_SIZE` | `1GB` | PyNCCL 通信 buffer 大小 |
+
+> **前置知识 & 依赖**
+>
+> | 领域 | 需要了解 | 对应依赖 / 工具 |
+> |------|---------|----------------|
+> | 环境变量机制 | `os.environ` 读取、`bool`/`int`/内存大小的解析方式 | Python stdlib |
+> | Ablation 实验 | 控制变量法：禁用单个优化 (如 overlap scheduling) 对比性能差异 | — |
+>
+> **自行扩展方向**: 如果你要加新的环境变量开关 (如禁用 CUDA Graph、强制使用某个 attention 后端)，在 `env.py` 的 `ENV` 类中添加属性，然后在对应模块中读取即可。
 
 ---
 
@@ -364,3 +467,18 @@ python benchmark/offline/bench.py --model-path Qwen/Qwen2.5-7B-Instruct
 | 进程模型 | 单进程 | 单进程 + Ray | 多进程 + ZMQ |
 
 **SGLang 的核心洞察**: 推理引擎的瓶颈不只在 GPU 计算，还在 CPU 调度开销和显存碎片。RadixAttention 解决前缀复用，Overlap Scheduling 隐藏 CPU 开销，PagedAttention 消除显存碎片。
+
+> **前置知识 & 依赖**
+>
+> | 领域 | 需要了解 | 对应依赖 / 工具 |
+> |------|---------|----------------|
+> | vLLM 架构 | PagedAttention 原始论文 (Kwon et al. 2023)、vLLM 的 Scheduler + Worker 设计 | — |
+> | HF Transformers | `model.generate()` 的 static batching 行为、`GenerationConfig` | `transformers` |
+> | Ray 分布式 | vLLM 用 Ray 做 TP 编排 vs SGLang 用 ZMQ + multiprocessing 的取舍 | — |
+> | 推理优化论文 | Orca (continuous batching)、SGLang (RadixAttention)、NanoFlow (overlap scheduling) | — |
+>
+> **推荐阅读顺序** (面向算法工程师):
+> 1. 先读 `core.py` 理解 Req/Batch/Context 三个核心抽象
+> 2. 再读 `scheduler/scheduler.py` 的 `normal_loop` (非 overlap 版本更易理解)
+> 3. 然后读 `engine/engine.py:forward_batch` 理解单次前向的完整流程
+> 4. 最后根据兴趣深入某个加速机制 (radix → `kvcache/radix_manager.py`，CUDA graph → `engine/graph.py` 等)
